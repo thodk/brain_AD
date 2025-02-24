@@ -1,0 +1,199 @@
+---
+title: "Tutorial 4. Differential Expression & Cell-Cell Communication Analysis"
+author: "Thodoris Koutsandreas, Iguaracy Pinheiro-de-Sousa, Umran Yaman"
+#date: 'Compiled: `r Sys.Date()`'  
+output: 
+  html_document:
+    toc: TRUE
+    code_folding:  "show"
+    theme: united
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  tidy = TRUE,
+  tidy.opts = list(width.cutoff = 95),
+  warning = FALSE,
+  error = TRUE,
+  echo = TRUE,
+  message = FALSE,
+  fig.width = 8,
+  time_it = TRUE,
+  include=TRUE
+)
+```
+
+
+
+```{r}
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(Seurat)
+  library(liana)
+  library(dplyr)
+})
+```
+
+<br>
+<br>
+
+### 1. Loading of the preprocessed snRNA-seq dataset - definition of Idents()
+
+The major.celltype will be selected as 'Idents', in order to set the cell types
+as the main classes of cell. This will help us to run automatically the 
+differential expression analysis for each pathological state (condition) separately 
+(non_AD, early_AD, late_AD), comparing the gene expression profiles of cell type 
+in each condition in order to identify the respective cell type markers.
+```{r}
+snRNA_qc_seurat_obj <- readRDS("../data/snRNA_qc_seurat_obj.rds")
+# The cell type in meta.data should be a factor
+snRNA_qc_seurat_obj$major.celltype <- as.factor(snRNA_qc_seurat_obj$major.celltype)
+Idents(snRNA_qc_seurat_obj) <- snRNA_qc_seurat_obj$major.celltype
+```
+
+<br>
+
+The analysis will be performed for each pathological condition Thus, the dataset 
+should be separated according to this factor.
+```{r}
+snRNA_by_condition <- SplitObject(snRNA_qc_seurat_obj, split.by = "Pathology")
+```
+
+<br>
+<br>
+
+### 2. Differential expression analysis for each cell type
+```{r, tidy='styler', tidy.opts=list(strict=FALSE)}
+
+markers_list <- list()
+
+for (condition in names(snRNA_by_condition)) {
+  
+  condition_seurat_obj <- snRNA_by_condition[[condition]] 
+  cell_types <- unique(condition_seurat_obj@meta.data$major.celltype)
+  
+  # Loop through each cell type
+  for (cell_type in cell_types) {
+    # Check the number of cells in this cell type
+    num_cells <- sum(condition_seurat_obj@meta.data$major.celltype == cell_type)
+    if (num_cells < 10) {
+      next  # Skip to the next cell type
+    }
+    # Perform differential expression analysis
+    markers <- FindMarkers(condition_seurat_obj, ident.1 = cell_type, 
+                           only.pos = TRUE, min.pct = 0.5, 
+                           logfc.threshold = 0.5)
+    markers_list[[paste(condition, cell_type, sep = "_")]] <- markers
+    print(paste(condition, cell_type, dim(markers)[1]))
+  }
+}
+
+# Save the markers list in the 'results' folder
+dir.create('../results/', showWarnings=FALSE)
+saveRDS(markers_list, '../results/dea_results.rds')
+```
+
+#### Check the results
+```{r}
+names(markers_list)
+```
+
+```{r}
+key = "late_AD_Microglia"
+head(markers_list[[key]])
+```
+
+<br>
+<br>
+
+### 3. Cell-cell communication analysis for each cell type
+
+```{r, tidy='styler', tidy.opts=list(strict=FALSE)}
+liana_results <- list()
+
+# Run LIANA for each condition
+for (condition in names(snRNA_by_condition)) {
+  condition_seurat_obj <- snRNA_by_condition[[condition]]
+  liana_results[[condition]] <- liana_wrap(condition_seurat_obj)
+}
+```
+
+<br>
+
+```{r}
+# Check how the results are organised
+print(names(liana_results))
+print(names(liana_results[['late_AD']]))
+head(liana_results[['late_AD']]$natmi, 20)
+```
+
+<br>
+
+#### Aggregation of liana results for each condition
+
+The liana_results list contains the results of different methods for each 
+pathological condition. In the block below, all the results are aggregated to
+create a single data frame for each condition, which includes the most
+significant ligand-receptor interactions for each pair of cell types.
+```{r}
+aggregated_liana_results <- list()
+# Process and save results for each subset
+for (condition in names(liana_results)) {
+  # Aggregate results
+  aggregated_liana <- liana_results[[condition]] %>% liana_aggregate()
+  # Filter results - keep the most significant
+  filtered_liana <- aggregated_liana %>% dplyr::filter(aggregate_rank <= 0.05)
+  aggregated_liana_results[[condition]] <- filtered_liana
+}
+
+# Save the results list in the 'results' folder
+saveRDS(aggregated_liana_results, '../results/ccc_results.rds')
+```
+
+<br>
+
+#### Visualization of cell-cell interactions
+
+<br>
+
+Interactions of Microglia cells with the other cell types in healthy state.
+```{r, fig.height = 8, fig.width = 8}
+
+cell_type_of_interest <- "Microglia"
+
+p <- liana_dotplot(
+  aggregated_liana_results$non_AD,
+  source_groups = c(cell_type_of_interest),  # Adjust this based on how your cell types are categorized (source or target)
+  target_groups = NULL,  # Adjust target groups as needed or based on your specific analysis requirements
+  ntop = 20,  # Assuming you want the top 20 interactions
+  size_range = c(1, 8),
+  y.label = '',
+) + theme(axis.text.x = element_text(angle = 90, size=10, hjust=1),
+          axis.text.y = element_text(size=10, vjust=1),
+          )
+p
+```
+
+<br>
+
+Interactions of Microglia cells with the other cell types in late AD.
+```{r, fig.height = 8, fig.width = 8}
+
+cell_type_of_interest <- "Microglia"
+
+p <- liana_dotplot(
+  aggregated_liana_results$late_AD,
+  source_groups = c(cell_type_of_interest),  # Adjust this based on how your cell types are categorized (source or target)
+  target_groups = NULL,  # Adjust target groups as needed or based on your specific analysis requirements
+  ntop = 20,  # Assuming you want the top 20 interactions
+  size_range = c(1, 8),
+  y.label = '',
+) + theme(axis.text.x = element_text(angle = 90, size=10, hjust=1),
+          axis.text.y = element_text(size=10, vjust=1),
+          )
+p
+```
+
+
+

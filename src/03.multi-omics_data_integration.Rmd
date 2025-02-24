@@ -1,0 +1,319 @@
+---
+title: "Tutorial 3. Multi-omics Data Integration"
+author: "Iguaracy Souza, Thodoris Koutsandreas, Umran Yaman"
+#date: 'Compiled: `r Sys.Date()`'  
+output: 
+  html_document:
+    toc: TRUE
+    code_folding:  "show"
+    theme: united
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  tidy = TRUE,
+  tidy.opts = list(width.cutoff = 95),
+  warning = FALSE,
+  error = TRUE,
+  echo = TRUE,
+  message = FALSE,
+  fig.width = 8,
+  time_it = TRUE
+)
+```
+
+
+```{r}
+suppressPackageStartupMessages({
+  library(Signac)
+  library(SingleCellExperiment)
+  library(Seurat)
+  library(ggplot2)
+  library(ggpubr)
+  library(cowplot)
+  library(RColorBrewer)
+})
+```
+
+
+### 1. Loading of the pre-processed snRNA-seq and snATAC-seq datasets.
+```{r}
+snRNA_qc_seurat_obj <- readRDS("../data/snRNA_qc_seurat_obj.rds")
+snATAC_qc_seurat_obj <- readRDS("../data/snATAC_qc_seurat_obj.rds")
+```
+
+<br>
+
+#### Cells in snRNA-seq data.
+```{r}
+dim(snRNA_qc_seurat_obj)
+table(snRNA_qc_seurat_obj$major.celltype)
+```
+
+<br>
+
+#### Cells in snATAC-seq data.
+```{r}
+dim(snATAC_qc_seurat_obj)
+table(snATAC_qc_seurat_obj$Celltype1)
+```
+
+<br>
+<br>
+
+### 2. Visualization of Cell Populations (Ground-Truth Annotation)
+
+<br>
+
+We will visualize the cells for both RNA and ATAC seq, based on the
+pre-defined cell type identities (derived from the original study), for 
+exploratory reasons. The visualization of cell populations is performed using 
+dimensionality reduction techniques (t-SNE or UMAP). These techniques help us 
+to depict the cells in two dimensions, making it easier to identify distinct cell 
+populations or clusters.
+
+```{r, include=TRUE, tidy='styler', tidy.opts=list(strict=FALSE), fig.height = 6, fig.width = 12}
+RNA_plot <- DimPlot(snRNA_qc_seurat_obj, group.by = "major.celltype", 
+                    label = TRUE, label.size = 5, repel=TRUE, pt.size = 0.01) + 
+  NoLegend() + 
+  ggtitle("snRNA-seq data")
+
+ATAC_plot <- DimPlot(snATAC_qc_seurat_obj, group.by = "Celltype1", 
+                     label = TRUE, , label.size = 5, repel=TRUE, , pt.size = 0.01) + 
+  NoLegend() + 
+  ggtitle("snATAC-seq data")
+
+## Plot together
+ggarrange(RNA_plot, ATAC_plot, ncol=2, nrow=1)
+```
+
+<br>
+<br>
+
+
+### 3. Integration and Normalization of the Gene Activities in the snATAC-seq Object
+
+<br>
+
+#### Integration
+
+```{r, include=TRUE, tidy='styler', tidy.opts=list(strict=FALSE)}
+gene_scores_obj <- readRDS("../data/initial_data/downsampled_snATAC_gene_scores_sumexp_obj.rds")
+gene_names <- rowData(gene_scores_obj)$name
+
+# Get the cell names from the snATAC-seq Seurat object and search for their 
+# records in the gene scores matrix
+qc_cells <- colnames(snATAC_qc_seurat_obj)
+
+# Before the subsetting
+print(dim(gene_scores_obj))
+gene_scores_obj <- gene_scores_obj[,qc_cells]
+# After the subsetting
+dim(gene_scores_obj)
+
+# Integrate the gene scores matrix 
+gene_score_matrix <- assay(gene_scores_obj, "GeneScoreMatrix")
+rownames(gene_score_matrix) <- gene_names
+snATAC_qc_seurat_obj[['ACTIVITY']] <- CreateAssayObject(counts = gene_score_matrix)
+```
+
+```{r, include=TRUE}
+gene_scores_obj <- NULL
+gene_score_matrix <- NULL
+gc()
+```
+
+<br>
+
+#### Normalization
+
+```{r, include=TRUE}
+DefaultAssay(snATAC_qc_seurat_obj) <- "ACTIVITY"
+snATAC_qc_seurat_obj <- NormalizeData(snATAC_qc_seurat_obj)
+snATAC_qc_seurat_obj <- ScaleData(snATAC_qc_seurat_obj, features = rownames(snATAC_qc_seurat_obj))
+```
+<br>
+
+#### Plot cell type markers' activities (SPI1 - Microglia and GFAP - Astrocytes)
+```{r, include=TRUE, tidy='styler', tidy.opts=list(strict=FALSE), fig.height = 4, fig.width = 12}
+FeaturePlot(
+  object = snATAC_qc_seurat_obj,
+  features = c('SPI1', 'GFAP'),
+  pt.size = 0.1,
+  slot="scale.data",
+  ncol = 2)
+```
+
+<br>
+<br>
+
+### 4. Identification of Anchors Between the snRNA- & snATAC-seq Data
+
+<br>
+
+By identifying anchors, we can find shared cell types identities or states between 
+the two omics datasets. This step is used to integrate information across 
+modalities and relate the gene expression profiles to the chromatin accessibility 
+ones.
+
+The RNA-seq data wiil be used to annotate the cell types in ATAC-seq.
+Two tasks will be performed:
+
+1. Detection of transfer anchors between the RNA- and ATAC-seq data.
+2. Annotation of snATAC-seq cells using label transfer.
+
+```{r, include=TRUE, tidy='styler', tidy.opts=list(strict=FALSE)}
+# FindTransferAnchors(), TransferData() and AddMetaData() functions are used 
+# from Seurat 
+
+# Find the anchors using the most variable features in the snRNA-seq data
+transfer.anchors <- FindTransferAnchors(reference = snRNA_qc_seurat_obj, 
+                                        query = snATAC_qc_seurat_obj, 
+                                        features = VariableFeatures(snRNA_qc_seurat_obj),
+                                        reference.assay = "RNA", 
+                                        query.assay = "ACTIVITY", 
+                                        reduction = "cca")
+
+# ATAC-seq cells annotation
+predictions <- TransferData(anchorset = transfer.anchors, 
+                            refdata = snRNA_qc_seurat_obj$major.celltype,
+                            weight.reduction = snATAC_qc_seurat_obj[["lsi"]], 
+                            dims = 2:30)
+print(head(predictions))
+
+snATAC_qc_seurat_obj <- AddMetaData(snATAC_qc_seurat_obj, metadata = predictions,
+                                    col.name = c('predicted.id', 'prediction.score.max'))
+```
+
+<br>
+<br>
+
+### 5. Comparison of Predicted & Ground-Truth Cell Type Annotations
+
+<br>
+
+In this step, after predicting cell type annotations for the snATAC-seq dataset, 
+we compare them with the ground-truth annotations to assess the performance of 
+the integration method. This step is to validate the accuracy of the integration 
+and identify any discrepancies or misclassifications.
+
+```{r, include=TRUE}
+# Make a new binary (TRUE - FALSE) column in metadata
+predicted <- snATAC_qc_seurat_obj$predicted.id
+true <- snATAC_qc_seurat_obj$Celltype1
+snATAC_qc_seurat_obj$correct_annotation <- predicted == true
+
+# Accuracy
+ratio <- sum(snATAC_qc_seurat_obj$correct_annotation)/dim(snATAC_qc_seurat_obj)[2]
+print(ratio)
+```
+
+<br>
+
+```{r, include=TRUE, tidy='styler', tidy.opts=list(strict=FALSE), fig.height = 6, fig.width = 12}
+# Plot the ground truth and predicted cell type annotations
+plot_for_ground_truth <- DimPlot(snATAC_qc_seurat_obj, group.by = "Celltype1", 
+                                 label = TRUE, label.size = 5, repel=TRUE, 
+                                 pt.size = 0.01) + 
+  NoLegend() + ggtitle("Ground-truth cell type annotations")
+
+plot_for_predictions <- DimPlot(snATAC_qc_seurat_obj, group.by = "predicted.id", 
+                                label = TRUE, label.size = 5, repel=TRUE, 
+                                pt.size = 0.01) + 
+  NoLegend() + ggtitle("Predicted cell type annotation")
+
+## Plot together
+ggarrange(plot_for_ground_truth, plot_for_predictions, ncol=2, nrow=1)
+```
+
+<br>
+<br>
+
+### 6. Exploration of Cell Type Predictions for the snATAC-seq Data
+
+<br>
+
+Using the following commands, we can visualize the agreement between the predicted 
+and ground-truth cell type annotations and plot the density of prediction scores.
+Finally the predicted cellular landscape is created to depict the inconsistencies
+between the two cell type annotations.
+
+```{r, include=TRUE, tidy='styler', tidy.opts=list(strict=FALSE), fig.height=6, fig.width=8}
+
+# Plot 1: Agreement scores between ground truth and predicted annotations
+predictions_df <- table(snATAC_qc_seurat_obj$Celltype1, snATAC_qc_seurat_obj$predicted.id)
+predictions_df <- predictions_df/rowSums(predictions_df)
+predictions_df <- as.data.frame(predictions_df)
+
+ggplot(predictions_df, aes(Var1, Var2, fill = Freq)) + 
+  geom_tile() + 
+  scale_fill_gradient(name = "Fraction of cells", low = "#f5f5f5", high = "#7d0025") + 
+  xlab("Cell type annotation (RNA)") + 
+  ylab("Predicted cell type label (ATAC)") +
+  theme_cowplot() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+
+# Plot 2: Distributions of correct and false classifications according to the prediction score
+correct <- length(which(snATAC_qc_seurat_obj$Celltype1 == snATAC_qc_seurat_obj$predicted.id))
+incorrect <- length(which(snATAC_qc_seurat_obj$Celltype1 != snATAC_qc_seurat_obj$predicted.id))
+data <- FetchData(snATAC_qc_seurat_obj, vars = c("prediction.score.max", "correct_annotation"))
+
+ggplot(data, aes(prediction.score.max, fill = correct_annotation, colour = correct_annotation)) +
+  geom_density(alpha = 0.5) + theme_cowplot() + 
+  scale_fill_discrete(name = "Correct Annotation", 
+                      labels = c(paste0("FALSE (n = ", incorrect, ")"), 
+                                 paste0("TRUE (n = ", correct, ")"))) + 
+  scale_color_discrete(name = "Correct Annotation",
+                       labels = c(paste0("FALSE (n = ", incorrect, ")"), 
+                                  paste0("TRUE (n = ", correct, ")"))) + 
+  xlab("Prediction Score")
+
+
+# Plot 3: UMAP plot of cell type clusters using the predicted annotations for colors to highlight the inconsistencies.
+DimPlot(object = snATAC_qc_seurat_obj, label = TRUE, group.by = "predicted.id") + NoLegend()
+```
+
+<br>
+<br>
+
+### 7. Embedding of cells from the snRNA- and snATAC-seq Data in a Common Space
+
+<br>
+
+An imputed gene expression profile will be created for each cell in the snATAC-seq data.
+We will restrict the imputation to the variable genes of snRNA-seq, but the full transcriptome
+could be used if we wanted to. In this way we will be able to project the cells from the two
+different modalities in a common space.
+```{r, include=TRUE, tidy='styler', tidy.opts=list(strict=FALSE)}
+# Define a new feature to keep the origin of each cell
+snRNA_qc_seurat_obj$origin <- "ATAC"
+snATAC_qc_seurat_obj$origin <- "RNA"
+
+# Create a common feature for the cell type identity
+snRNA_qc_seurat_obj$cell_type <- snRNA_qc_seurat_obj$major.celltype
+snATAC_qc_seurat_obj$cell_type <- snATAC_qc_seurat_obj$predicted.id
+
+# Perform the imputation
+genes <- VariableFeatures(snRNA_qc_seurat_obj)
+ref_data <- GetAssayData(snRNA_qc_seurat_obj, assay = "RNA", slot = "data")[genes,]
+imputation <- TransferData(anchorset = transfer.anchors, 
+                           refdata = ref_data, 
+                           weight.reduction = snATAC_qc_seurat_obj[["lsi"]], 
+                           dims = 2:30)
+snATAC_qc_seurat_obj[["RNA"]] <- imputation
+embedded_obj <- merge(x=snRNA_qc_seurat_obj, y=snATAC_qc_seurat_obj)
+```
+
+<br>
+
+Dimensionality reduction is performed on the embedded data to project all the cells
+in a common two-dimensional space.
+```{r, include=TRUE, tidy='styler', tidy.opts=list(strict=FALSE), fig.height = 5, fig.width = 12}
+embedded_obj <- ScaleData(embedded_obj, features = genes, do.scale = FALSE)
+embedded_obj <- RunPCA(embedded_obj, features = genes, verbose = FALSE)
+embedded_obj <- RunUMAP(embedded_obj, dims = 1:5)
+
+DimPlot(embedded_obj, group.by = c("origin", "cell_type"))
+```

@@ -1,0 +1,274 @@
+---
+title: "Tutorial 1: Quality Control and Preprocessing of the snATAC-seq Data"
+author: "Iguaracy Souza, Thodoris Koutsandreas, Umran Yaman"
+#date: 'Compiled: `r Sys.Date()`'  
+output: 
+  html_document:
+    toc: TRUE
+    code_folding:  "show"
+    theme: united
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  tidy = TRUE,
+  tidy.opts = list(width.cutoff = 95),
+  warning = FALSE,
+  error = TRUE,
+  echo = TRUE,
+  message = FALSE,
+  fig.width = 8,
+  time_it = TRUE
+)
+```
+
+
+### Dataset
+The initial dataset contains more than 170k snATAC-seq samples and could be found here: 
+[PeakMatrix.TSS6.cleaned.rds](https://personal.broadinstitute.org/bjames/AD_snATAC/TSS6_highQC). 
+In this project, only a subset of that dataset will be used, in order to reduce 
+the necessary resources to analyze the data, as well as the execution time. 
+This subset was created by down sampling each cell type separately in order 
+to have a maximum of 3500 cells. The subset() function was used for this task.
+
+
+Loading of the required libraries for the quality control of the scATAC-seq dataset.
+```{r, include=TRUE}
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(SingleCellExperiment)
+  library(Seurat)
+  library(Signac)
+  library(EnsDb.Hsapiens.v86)
+  library(biovizBase)
+  library(Matrix)
+})
+```
+
+
+
+### 1. Creation of Seurat Object for the snATAC-seq Data
+
+The downsampled dataset is in SingleCellExperiment format. It needs to be 
+transformed into a Seurat object in order to generate the chromatin assay.
+```{r, include=TRUE, tidy='styler', tidy.opts=list(strict=FALSE)}
+sce_obj <- readRDS('../data/initial_data/downsampled_snATAC_sce_obj.rds')
+
+# Extract the counts
+counts <- assay(sce_obj, "PeakMatrix")
+
+# Create a new Seurat object
+snATAC_seurat_obj <- CreateSeuratObject(counts = counts)
+
+# Add the metadata for cells
+metadata <- as.data.frame(colData(sce_obj))
+rownames(metadata) <- colnames(snATAC_seurat_obj)
+snATAC_seurat_obj@meta.data <- metadata
+
+# Extract genomic ranges and create a Chromatin Assay
+granges <- rowRanges(sce_obj)
+annotation <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+seqlevels(annotation) <- paste0('chr', seqlevels(annotation))
+genome(annotation) <- "hg38"
+chrom_assay <- CreateChromatinAssay(counts = counts, ranges = granges, 
+                                    genome = 'hg38', annotation = annotation)
+snATAC_seurat_obj[['ATAC']] <- chrom_assay
+DefaultAssay(snATAC_seurat_obj) <- 'ATAC'
+```
+
+```{r}
+# Remove the initial and intermediate objects as we need only snATAC_seurat_obj
+# for the downstream processing.
+counts <- NULL
+chrom_assay <- NULL
+sce_obj <- NULL
+gc()
+```
+
+<br>
+<br>
+
+### 2. Transcription Start Site (TSS) Enrichment Score and Quality Control
+
+TSS enrichment scores and quality control plots are generated to assess the 
+distribution and enrichment of peaks around transcription start sites. 
+These plots help to evaluate the quality and reliability of the ATAC-seq data, 
+by examining the distribution of peaks relative to TSS.
+
+<br>
+
+The DensityScatter() function enables visualization of the connections 
+between variables stored in the object metadata. Additionally, it serves as a 
+rapid tool for identifying appropriate cutoff values for various QC metrics 
+when quantiles=TRUE is specified.
+```{r, include=TRUE, tidy='styler', tidy.opts=list(strict=FALSE)}
+DensityScatter(snATAC_seurat_obj, x = 'nCount_ATAC', y = 'TSSEnrichment', 
+               log_x = TRUE, quantiles = TRUE)
+```
+
+<br>
+
+#### QC Metrics - Violin Plot
+
+VlnPlot() from the Seurat library could be used to visualize the distribution of key 
+QC metrics, including the number of peaks per cell (nCount_peaks), TSS enrichment 
+(TSSEnrichment), and the proportion of peaks in blacklist regions (BlacklistRatio). 
+In this way, cells with outlier values in these metrics can be detected and 
+removed from the dataset.
+```{r,include=TRUE, tidy='styler', tidy.opts=list(strict=FALSE)}
+# QC Metrics Violin Plot
+VlnPlot(
+  object = snATAC_seurat_obj,
+  features = c('nCount_ATAC', 'TSSEnrichment', 'BlacklistRatio'),
+  pt.size = 0.0,
+  ncol = 3
+)
+```
+
+<br>
+
+#### Removal of Outliers 
+
+Outliers will be defined based on the number of peaks, TSS enrichment, and the 
+proportion of peaks in blacklist regions. At the end of this step, only 
+high-quality cells will be retained for the downstream analysis.
+```{r, include=TRUE, tidy='styler', tidy.opts=list(strict=FALSE)}
+# Before QC filtering
+print(dim(snATAC_seurat_obj))
+
+snATAC_seurat_obj <- subset(
+  x = snATAC_seurat_obj,
+  subset = nCount_ATAC > 5000 &
+    nCount_ATAC < 40000 &
+    BlacklistRatio < 0.05 &
+    TSSEnrichment > 3
+)
+
+# After QC filtering
+print(dim(snATAC_seurat_obj))
+
+# Remove old object and clean-up the space
+```
+
+<br>
+<br>
+
+### 3. Normalization and Linear Dimensionality Reduction
+
+#### 3.1. Normalization
+Normalization in Signac involves a two-step process, utilizing Term 
+Frequency-Inverse Document Frequency (TF-IDF) normalization. This normalization 
+is performed across cells to address differences in cellular sequencing depth 
+and across peaks, assigning higher values to rarer peaks.
+
+#### 3.2. Feature selection
+For feature selection, the limited dynamic range of snATAC-seq data poses 
+challenges for conventional variable feature selection methods applied in 
+snRNA-seq. Instead, options include choosing the top n% of features (peaks) 
+for dimensionality reduction or excluding features present in fewer than N cells 
+using the FindTopFeatures() function. In this task, we opt to use all features, 
+but you can experiment with subsets of features (e.g., by setting min.cutoff to 
+'q75' for the top 25% of peaks), which can yield similar results with faster 
+runtimes. Features selected for dimensionality reduction are automatically 
+designated as VariableFeatures() for the Seurat object.
+
+#### 3.3. Dimensionality reduction
+For dimensionality reduction, Signac employs the method of Singular Value 
+Decomposition (SVD) on the TF-IDF matrix, using the previously selected features 
+(peaks). This process yields a reduced-dimension representation of the object, 
+akin to the output of Principal Component Analysis (PCA) in snRNA-seq.
+
+<br>
+
+In the following block, three different tasks are performed:
+
+1. Finding of the top features
+2. Execution of the TF-IDF normalization
+3. Dimensionality reduction with SVD (Singular Value Decomposition)
+```{r, include=TRUE}
+# Find top features, run TF-IDF, and run SVD for normalization and linear dimensional reduction
+snATAC_seurat_obj <- FindTopFeatures(snATAC_seurat_obj, min.cutoff = 5)
+snATAC_seurat_obj <- RunTFIDF(snATAC_seurat_obj)
+snATAC_seurat_obj <- RunSVD(snATAC_seurat_obj)
+```
+
+<br>
+<br>
+
+### 4. Depth Correlation Plot
+
+The initial Latent Semantic Indexing (LSI) component frequently reflects 
+sequencing depth, representing technical variation rather than biological 
+differences. In such instances, it is advisable to exclude this component from 
+subsequent analyses. The correlation between each LSI component and sequencing 
+depth can be evaluated using the DepthCor() function. In other words, a correlation 
+plot is created, using the DepthCor() function, in order to assess the correlation 
+between the number of sequencing reads (depth) and other QC metrics. We can 
+check for potential biases related to sequencing depth in the dataset.
+```{r, include=TRUE}
+# Depth Correlation Plot
+DepthCor(snATAC_seurat_obj)
+```
+
+<br>
+<br>
+
+### 5. Uniform Manifold Approximation and Projection (UMAP) and Clustering
+
+We can perform dimensionality reduction running the UMAP method and using 
+the SVD dimensions from 2 to 30, because usually the first one is related to 
+technical biases.
+```{r, include=TRUE, tidy='styler', tidy.opts=list(strict=FALSE), fig.height = 6, fig.width = 8}
+# Non-linear dimension reduction and clustering using UMAP
+snATAC_seurat_obj <- RunUMAP(object = snATAC_seurat_obj, 
+                             reduction = 'lsi', dims = 2:30)
+
+DimPlot(object = snATAC_seurat_obj, label = TRUE, 
+        group.by = "Celltype1") + NoLegend()
+
+```
+
+
+<br>
+<br>
+
+### 6. Integration of the Gene Scores
+```{r}
+gene_scores_obj <- readRDS("../data/initial_data/downsampled_snATAC_gene_scores_sumexp_obj.rds")
+gene_names <- rowData(gene_scores_obj)$name
+
+# Get the cell names from the Seurat object and search for the respective part
+# of gene scores matrix
+qc_cells <- colnames(snATAC_seurat_obj)
+
+# Before the subsetting
+print(dim(gene_scores_obj))
+gene_scores_obj <- gene_scores_obj[,qc_cells]
+# After the subsetting
+dim(gene_scores_obj)
+
+# Integrate the gene scores matrix 
+#gene_score_matrix <- assay(gene_scores_obj, "GeneScoreMatrix")
+#rownames(gene_score_matrix) <- gene_names
+#snATAC_seurat_obj[['ACTIVITY']] <- CreateAssayObject(counts = gene_score_matrix)
+```
+
+<br>
+<br>
+
+### 7. Normalization of Gene Scores
+```{r}
+#DefaultAssay(snATAC_seurat_obj) <- "ACTIVITY"
+#snATAC_seurat_obj <- NormalizeData(snATAC_seurat_obj)
+#snATAC_seurat_obj <- ScaleData(snATAC_seurat_obj, features = rownames(snATAC_seurat_obj))
+```
+
+<br>
+<br>
+
+### 8. Saving of the QC and Preprocessed Dataset
+```{r}
+saveRDS(snATAC_seurat_obj, file = "../data/snATAC_qc_seurat_obj.rds")
+```
+
