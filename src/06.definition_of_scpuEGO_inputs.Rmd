@@ -1,0 +1,270 @@
+---
+title: "Tutorial 7. Seed Node Selection - scpuEGO"
+author: "Iguaracy Souza and Umran YAMAN"
+date: 'Compiled: `r Sys.Date()`'  
+output: 
+  html_document:
+    toc: TRUE
+    code_folding:  "show"
+    theme: united
+    df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  tidy = TRUE,
+  tidy.opts = list(width.cutoff = 95),
+  warning = FALSE,
+  error = TRUE,
+  echo = TRUE,
+  message = FALSE,
+  fig.width = 8,
+  time_it = TRUE
+)
+```
+
+
+```{r}
+suppressPackageStartupMessages({
+  library(enrichR)
+})
+```
+
+
+### 1. Results from Differential Expression Analysis
+```{r, tidy='styler', tidy.opts=list(strict=FALSE)}
+dea_results <- readRDS('../results/dea_results.rds')
+
+# Check the sizes
+for (key in names(dea_results)) {
+  tmp_df <- dea_results[[key]]
+  print(paste(key, dim(tmp_df)[1]))
+}
+
+# Example
+key <- 'non_AD_Microglia'
+head(dea_results[[key]], 15)
+```
+
+<br>
+<br>
+
+### 2. Results from Cell-Cell Communication Analysis
+```{r, tidy='styler', tidy.opts=list(strict=FALSE)}
+ccc_results <- readRDS('../results/ccc_results.rds')
+
+# Check the sizes
+for (key in names(ccc_results)) {
+  tmp_df <- ccc_results[[key]]
+  print(paste(key, dim(tmp_df)[1]))
+}
+
+# Example
+key <- 'non_AD'
+head(ccc_results[[key]], 15)
+```
+
+<br>
+<br>
+
+
+### 3. Definition of Differentially Expressed Genes & Receptors per Cell Type & Condition
+```{r, tidy='styler', tidy.opts=list(strict=FALSE)}
+receptors_list <- list()
+degs_list <- list()
+
+for (key in names(dea_results)) {
+  degs <- rownames(dea_results[[key]])
+  condition <- paste(strsplit(key, split='_')[[1]][1:2], collapse = '_')
+  cell_type <- strsplit(key, split='_')[[1]][3]
+  tmp_df <- ccc_results[[condition]]
+  tmp_df <- tmp_df[tmp_df$target == cell_type,]
+  receptors <- unlist(strsplit(tmp_df$receptor.complex, split="_"))
+  receptors <- unique(receptors)
+  deg_receptors <- intersect(receptors, degs)
+  degs <- setdiff(degs, receptors)
+  receptors_list[[key]] <- deg_receptors
+  degs_list[[key]] <- degs
+}
+```
+
+<br>
+<br>
+
+### 4. Results from TF Activity Analysis
+```{r, tidy='styler', tidy.opts=list(strict=FALSE)}
+tf_results <- readRDS('../results/tf_results.rds')
+
+# Check the sizes
+for (key in names(tf_results)) {
+  tmp_df <- tf_results[[key]]
+  if (dim(tmp_df)[1] > 40) {
+    tmp_df <- tmp_df[order(tmp_df$fold.enrichment, decreasing = TRUE),]
+    tmp_df <- tmp_df[1:40,]
+    tf_results[[key]] <- tmp_df
+  }
+    print(paste(key, dim(tmp_df)[1]))
+}
+
+# Example
+key <- 'non_AD_Vascular'
+head(tf_results[[key]], 15)
+```
+
+<br>
+<br>
+
+### 5. Run Enrichment Analysis with Receptors & TFs
+
+The enrichment analysis will be performed on the GOBP annotation in order to filter
+and reduce the size of differentially expressed gene sets for each combination of 
+cell type and pathological condition. As input gene set for the enrichment analysis
+we will use the union of differentially expressed receptors and deregulated TFs. 
+In this way, the enriched GOBP terms will include signalling and regulatory 
+processes associated with these proteins. Then, for each cell type and 
+condition, the set of differentially expressed genes will be filtered keeping only
+those genes which participate in the enriched processes. Thus, this step will help us
+to interconnect the layers of receptors, TFs and degs, based on their common 
+functional background, removing uncorrelated genes. 
+
+<br>
+
+Loading of the Gene Ontology Biological Process (GOBP) annotation.
+```{r,  include=TRUE, tidy='styler', tidy.opts=list(strict=FALSE)}
+gobp_annotation <- read.csv("../data/GOBP_annotation.csv")
+```
+
+<br>
+
+Enrichment analysis and filtering of differentially expressed gene sets, 
+for each pair of cell type and condition. The enrichment analysis will be
+performed with the enrichR package.
+```{r, include=TRUE, tidy='styler', tidy.opts=list(strict=FALSE)}
+gene_sets_for_phuEGO <- list()
+
+for (key in names(tf_results)) {
+  tfs <- tf_results[[key]]$motif.name
+  deg_receptors <- receptors_list[[key]]
+  input_set <- union(tfs, deg_receptors)
+
+  # EA analysis with enrichR
+  ea_results <- enrichr(input_set, database = "GO_Biological_Process_2023")
+  ea_results <- ea_results[["GO_Biological_Process_2023"]]
+  ea_results <- ea_results[ea_results$Adjusted.P.value < 0.05,]
+  
+  # Create an extra column with the GO ids.
+  ea_results$go_id <- sapply(ea_results$Term, function(term) {
+    fields <- strsplit(term, split=' ')[[1]]
+    go_id = fields[length(fields)]
+    gsub(x=go_id, pattern = '\\(|\\)', replacement = '')
+  }, USE.NAMES = FALSE)
+  
+  # Retrieve the genes that are annotated with the enriched GOBP terms.
+  background_genes <- gobp_annotation[gobp_annotation$GO_Terms %in% ea_results$go_id, ]$SYMBOL
+  background_genes <- unique(background_genes)
+  
+  # Filter the DEGs
+  degs <- rownames(dea_results[[key]])
+  degs <- intersect(degs, background_genes)
+  
+  # Collect the genes of the three layers in a list
+  gene_sets_for_phuEGO[[key]] <- list(
+    receptors=deg_receptors,
+    tfs=tfs,
+    degs=degs
+  )
+}
+```
+
+<br>
+<br>
+
+
+### 6. Construction of sc-phuEGO Inputs
+
+<br>
+
+In the previous section we defined the input sets for each cell type and condition.
+However we need to give a weight to each gene, as these scores will be used
+from phuEGO during the network propagation task. The weights of degs and 
+receptors will be defined based on their log fold change values in the results
+of differential expression analysis, while those of tfs will be defined from their
+enrichment statistics in the motif analysis.
+```{r, include=TRUE, tidy='styler', tidy.opts=list(strict=FALSE)}
+
+weighted_dfs <- list()
+
+for (key in names(gene_sets_for_phuEGO)) {
+  gene_sets <- gene_sets_for_phuEGO[[key]]
+  
+  # Weights for degs and receptors
+  tmp_df1 <- dea_results[[key]]
+  tmp_df1 <- tmp_df1[union(gene_sets[['degs']], gene_sets[['receptors']]),]
+  tmp_df1 <- tmp_df1[, 'avg_log2FC', drop=FALSE]
+  colnames(tmp_df1) <- c('weight')
+  
+  # Weights for TFs
+  tmp_df2 <- tf_results[[key]]
+  tmp_df2 <- tmp_df2[tmp_df2$motif.name %in% gene_sets[['tfs']],]
+  tmp_df2 <- tmp_df2[, c('fold.enrichment', 'motif.name')]
+  # A correction in some TF names - remove parenthesis
+  tmp_df2$motif.name <- sapply(tmp_df2$motif.name, function(s) {
+    strsplit(s, '\\(')[[1]][1]
+  }, USE.NAMES = FALSE)
+  # Order the TFs according to their weight and remove duplicated motif.name
+  tmp_df2 <- tmp_df2[order(tmp_df2$fold.enrichment, decreasing = TRUE),]
+  tmp_df2 <- tmp_df2[!duplicated(tmp_df2$motif.name),]
+  rownames(tmp_df2) <- tmp_df2$motif.name
+  tmp_df2$motif.name <- NULL
+  colnames(tmp_df2) <- c('weight')
+
+  # Concatenate the two data frames
+  final_df <- rbind(tmp_df1, tmp_df2)
+  
+  weighted_dfs[[key]] <- final_df
+}
+```
+
+<br>
+
+Finally we will translate the gene symbols (rownames in the generated data frames) 
+into UniProt ids, as this is the appropriate format to run phuEGO.
+```{r, include=TRUE, tidy='styler', tidy.opts=list(strict=FALSE)}
+text <- readLines('../data/gene_to_uniprot.tab')
+gene_to_uniprot <- c()
+for (entry in text) {
+  fields <- strsplit(entry, split = '\t')[[1]]
+  gene_to_uniprot <- rbind(gene_to_uniprot, c(fields[1], fields[2]))
+}
+colnames(gene_to_uniprot) <- c('gene_symbol', 'uniprot_id')
+
+
+phuEGO_input_dfs <- list()
+
+for (key in names(weighted_dfs)) {
+  df <- weighted_dfs[[key]]
+  df <- merge(df, gene_to_uniprot, by.x=0, by.y='gene_symbol', all.x=TRUE)
+  df <- df[!is.na(df$uniprot_id),]
+  rownames(df) <- df$uniprot_id
+  df$uniprot_id <- NULL
+  df$Row.names <- NULL
+  phuEGO_input_dfs[[key]] <- df
+}
+```
+
+
+Saving of sc-phuEGO inputs in the results folder
+```{r, include=TRUE, tidy='styler', tidy.opts=list(strict=FALSE)}
+main_dir <- '../results/sc-phuEGO_inputs/'
+dir.create(main_dir, showWarnings = FALSE, recursive = TRUE)
+
+for (key in names(phuEGO_input_dfs)) {
+  df <- phuEGO_input_dfs[[key]]
+  filename <- paste(main_dir, key, '.txt', sep='')
+  write.table(df, filename, col.names = FALSE, sep='\t', quote = FALSE)
+}
+```
+
+
+
+
